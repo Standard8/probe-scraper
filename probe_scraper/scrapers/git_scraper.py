@@ -3,12 +3,15 @@
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 import os
+import re
 import tempfile
 import traceback
 from collections import defaultdict
 from datetime import datetime, timedelta
 
 import git
+
+GIT_HASH_PATTERN = re.compile("([A-Fa-f0-9]){40}")
 
 # WARNING!
 # Changing these dates can cause files that had metrics to
@@ -72,15 +75,20 @@ def _file_in_repo_head(repo, filename):
     return filename in subtree
 
 
-def get_commits(repo, filename):
+def get_commits(repo, filename, commit):
     sep = ":"
     log_format = '--format="%H{}%ct"'.format(sep)
     # include "--" to prevent error for filename not in current tree
-    change_commits = repo.git.log(log_format, "--", filename).split("\n")
+    if commit is None:
+        change_commits = repo.git.log(log_format, "--", filename).split("\n")
+    else:
+        change_commits = repo.git.log(
+            commit, "-n", "1", log_format, "--", filename
+        ).split("\n")
     # filter out empty strings
     change_commits = filter(None, change_commits)
     commits = set(enumerate(change_commits))
-    if _file_in_repo_head(repo, filename):
+    if commit is None and _file_in_repo_head(repo, filename):
         # include HEAD when it contains filename
         commits |= set(enumerate(repo.git.log("-n", "1", log_format).split("\n")))
 
@@ -105,11 +113,56 @@ def utc_timestamp(d):
     return (d - datetime(1970, 1, 1)) / timedelta(seconds=1)
 
 
-def retrieve_files(repo_info, cache_dir):
+def get_cached_repo(repo_info, cache_dir, commit, branch):
+    repo_path = os.path.join(cache_dir, f"{repo_info.name}.git")
+    if commit is not None:
+        print(f"Pulling single commit into {repo_path}")
+        if os.path.exists(repo_path):
+            repo = git.Repo(repo_path)
+        else:
+            repo = git.Repo.init(repo_path, bare=True)
+            repo.git.remote("add", "origin", repo_info.url)
+    elif os.path.exists(repo_path):
+        print(f"Pulling latest commits into {repo_path}")
+        repo = git.Repo(repo_path)
+    else:
+        print(f"Cloning {repo_info.url} into {repo_path}")
+        repo = git.Repo.clone_from(repo_info.url, repo_path, bare=True)
+
+    prod_branch = repo_info.branch or repo.active_branch
+    if commit is None:
+        is_prod = True
+        repo.git.fetch("origin", f"{prod_branch}:{prod_branch}")
+        repo.git.symbolic_ref("HEAD", f"refs/heads/{prod_branch}")
+    elif GIT_HASH_PATTERN.fullmatch(commit) is None:
+        raise ValueError("commit must be a full length git hash")
+    else:
+        repo.git.fetch("origin", commit, depth=1)
+        if str(prod_branch) == branch:
+            # Check that this commit is authorized to be published by being in prod_branch
+            repo.git.fetch("origin", f"{prod_branch}:{prod_branch}", depth=1)
+            repo.git.symbolic_ref("HEAD", f"refs/heads/{prod_branch}")
+            # require commit to be in branch
+            if commit != repo.head.commit.hexsha:
+                # commit is not head, check full branch
+                repo.git.fetch("origin", f"{prod_branch}:{prod_branch}")
+                try:
+                    repo.git.merge_base(commit, "HEAD", is_ancestor=True)
+                except git.GitCommandError:
+                    raise ValueError(
+                        f"commit {commit} not found in branch {prod_branch}"
+                    )
+            is_prod = True
+        else:
+            is_prod = False
+
+    return repo, is_prod
+
+
+def retrieve_files(repo_info, cache_dir, commit, branch):
     results = defaultdict(list)
     timestamps = dict()
     base_path = os.path.join(cache_dir, repo_info.name)
-    repo_path = f"{base_path}.git"
 
     min_date = None
     if repo_info.name in MIN_DATES:
@@ -117,19 +170,10 @@ def retrieve_files(repo_info, cache_dir):
 
     skip_commits = SKIP_COMMITS.get(repo_info.name, [])
 
-    if os.path.exists(repo_path):
-        print(f"Pulling latest commits into {repo_path}")
-        repo = git.Repo(repo_path)
-    else:
-        print(f"Cloning {repo_info.url} into {repo_path}")
-        repo = git.Repo.clone_from(repo_info.url, repo_path, bare=True)
-
-    branch = repo_info.branch or repo.active_branch
-    repo.git.fetch("origin", f"{branch}:{branch}")
-    repo.git.symbolic_ref("HEAD", f"refs/heads/{branch}")
+    repo, is_prod = get_cached_repo(repo_info, cache_dir, commit, branch)
 
     for rel_path in repo_info.get_change_files():
-        hashes = get_commits(repo, rel_path)
+        hashes = get_commits(repo, rel_path, commit)
         for _hash, (ts, index) in hashes.items():
             if min_date and ts < min_date:
                 continue
@@ -149,10 +193,10 @@ def retrieve_files(repo_info, cache_dir):
             results[_hash].append(disk_path)
             timestamps[_hash] = (ts, index)
 
-    return timestamps, results
+    return timestamps, results, is_prod
 
 
-def scrape(folder=None, repos=None):
+def scrape(folder=None, repos=None, commit=None):
     """
     Returns two data structures. The first is the commit timestamps:
     {
@@ -180,6 +224,7 @@ def scrape(folder=None, repos=None):
     results = {}
     timestamps = {}
     emails = {}
+    prod_repos = []
 
     for repo_info in repos:
         print("Getting commits for repository " + repo_info.name)
@@ -191,12 +236,13 @@ def scrape(folder=None, repos=None):
         }
 
         try:
-            ts, commits = retrieve_files(repo_info, folder)
+            ts, commits, is_prod = retrieve_files(repo_info, folder, commit)
             print("  Got {} commits".format(len(commits)))
             results[repo_info.name] = commits
             timestamps[repo_info.name] = ts
+            if is_prod:
+                prod_repos.append(repo_info.name)
         except Exception:
-            raise
             emails[repo_info.name]["emails"].append(
                 {
                     "subject": "Probe Scraper: Failed Probe Import",
@@ -204,4 +250,4 @@ def scrape(folder=None, repos=None):
                 }
             )
 
-    return timestamps, results, emails
+    return timestamps, results, emails, prod_repos

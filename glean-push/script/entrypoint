@@ -1,0 +1,27 @@
+#!/bin/bash
+
+set -e -o pipefail
+
+if [ "$#" = 0 ] || [ "$1" = "glean-push" ]; then
+  if [ "$CIRCLECI" = "true" ]; then
+    COMMIT="${CIRCLE_SHA1:?Required variable not set or empty}"
+    BRANCH="${CIRCLE_BRANCH:?Required variable not set or empty}"
+    if [ -n "$CIRCLE_PR_REPONAME" ]; then
+      # prefix branch names from forks
+      BRANCH="${CIRCLE_PR_REPONAME}:${BRANCH}"
+    fi
+    URL="${CIRCLE_REPOSITORY_URL:?Required variable not set or empty}"
+  else
+    : "${COMMIT:?Required variable not set or empty}"
+    : "${BRANCH:?Required variable not set or empty}"
+    : "${URL:?Required variable not set or empty}"
+  fi
+  : "${TRIGGER_URL:?Required build argument not set or empty}"
+
+  DATA="$(jq --compact-output --null-input '{url:env.URL,commit:env.COMMIT,branch:env.BRANCH}')"
+
+  echo "Pushing commit to probe scraper: $DATA"
+  exec curl "${TRIGGER_URL}" --data "$DATA"
+else
+  exec "$@"
+fi

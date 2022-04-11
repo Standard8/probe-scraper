@@ -5,20 +5,20 @@
 import argparse
 import datetime
 import errno
-import gzip
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import traceback
 from collections import defaultdict
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional
 
 from dateutil.tz import tzlocal
 
 from . import fog_checks, glean_checks, transform_probes, transform_revisions
 from .emailer import send_ses
+from .remote_storage import remote_storage_pull, remote_storage_push
 from .parsers.events import EventsParser
 from .parsers.histograms import HistogramsParser
 from .parsers.metrics import GleanMetricsParser
@@ -62,7 +62,7 @@ def general_data():
     }
 
 
-def dump_json(data, out_dir, file_name):
+def dump_json(data, out_dir: Path, file_name: str) -> Path:
     # Make sure that the output directory exists. This also creates
     # intermediate directories if needed.
     try:
@@ -75,7 +75,7 @@ def dump_json(data, out_dir, file_name):
         if isinstance(o, datetime.datetime):
             return o.isoformat()
 
-    path = os.path.join(out_dir, file_name)
+    path = out_dir / file_name
     with open(path, "w") as f:
         print("  " + path)
         json.dump(
@@ -86,11 +86,12 @@ def dump_json(data, out_dir, file_name):
             separators=(",", ": "),
             default=date_serializer,
         )
+    return path
 
 
-def write_moz_central_probe_data(probe_data, revisions, out_dir):
+def write_moz_central_probe_data(probe_data, revisions, out_dir: Path) -> List[Path]:
     # Save all our files to "outdir/firefox/..." to mimic a REST API.
-    base_dir = os.path.join(out_dir, "firefox")
+    base_dir = out_dir / "firefox"
 
     print("\nwriting output:")
     dump_json(general_data(), base_dir, "general")
@@ -103,10 +104,13 @@ def write_moz_central_probe_data(probe_data, revisions, out_dir):
         data_dir = os.path.join(base_dir, channel, "main")
         dump_json(channel_probes, data_dir, "all_probes")
 
+    return [base_dir]
+
 
 def write_general_data(out_dir):
-    dump_json(general_data(), out_dir, "general")
-    with open(os.path.join(out_dir, "index.html"), "w") as f:
+    general_path = dump_json(general_data(), out_dir, "general")
+    index_path = out_dir / "index.html"
+    with open(index_path, "w") as f:
         f.write(
             """
             <html><head><title>Mozilla Probe Info</title></head>
@@ -116,6 +120,7 @@ def write_general_data(out_dir):
             </body></html>
             """
         )
+    return [general_path, index_path]
 
 
 def write_glean_metric_data(metrics, dependencies, out_dir):
@@ -123,7 +128,7 @@ def write_glean_metric_data(metrics, dependencies, out_dir):
     for repo, metrics_data in metrics.items():
         dependencies_data = dependencies[repo]
 
-        base_dir = os.path.join(out_dir, "glean", repo)
+        base_dir = out_dir / "glean" / repo
 
         dump_json(general_data(), base_dir, "general")
         dump_json(metrics_data, base_dir, "metrics")
@@ -133,31 +138,34 @@ def write_glean_metric_data(metrics, dependencies, out_dir):
 def write_glean_tag_data(tags, out_dir):
     # Save all our files to "outdir/glean/<repo>/..." to mimic a REST API.
     for repo, tags_data in tags.items():
-        base_dir = os.path.join(out_dir, "glean", repo)
+        base_dir = out_dir / "glean" / repo
         dump_json(tags_data, base_dir, "tags")
 
 
 def write_glean_ping_data(pings, out_dir):
     # Save all our files to "outdir/glean/<repo>/..." to mimic a REST API.
     for repo, pings_data in pings.items():
-        base_dir = os.path.join(out_dir, "glean", repo)
+        base_dir = out_dir / "glean" / repo
         dump_json(pings_data, base_dir, "pings")
 
 
-def write_repositories_data(repos, out_dir):
+def write_repositories_data(repos, out_dir) -> List[Path]:
     json_data = [r.to_dict() for r in repos]
-    dump_json(json_data, os.path.join(out_dir, "glean"), "repositories")
+    file_path = dump_json(json_data, out_dir, "repositories")
+    return [file_path]
 
 
-def write_v2_data(repos, out_dir):
+def write_v2_data(repos, out_dir) -> List[Path]:
+    base_dir = out_dir / "v2" / "glean"
     dump_json(
-        repos["app-listings"], os.path.join(out_dir, "v2", "glean"), "app-listings"
+        repos["app-listings"], base_dir, "app-listings"
     )
     dump_json(
         repos["library-variants"],
-        os.path.join(out_dir, "v2", "glean"),
+        base_dir,
         "library-variants",
     )
+    return [base_dir]
 
 
 def parse_moz_central_probes(scraped_data):
@@ -232,8 +240,11 @@ def add_first_appeared_dates(probes_by_channel, first_appeared_dates):
 
 
 def load_moz_central_probes(
-    cache_dir, out_dir, fx_version, min_fx_version, firefox_channel
+    cache_dir, out_dir, fx_version, min_fx_version, firefox_channel,
+    update_mode: bool = False,
 ):
+    if update_mode:
+        raise NotImplementedError("update mode not implemented for moz central")
 
     if fx_version:
         min_fx_version = fx_version
@@ -280,7 +291,9 @@ def load_moz_central_probes(
     )
 
     # Serialize the probe data to disk.
-    write_moz_central_probe_data(probes_by_channel_with_dates, revision_dates, out_dir)
+    update_paths = write_moz_central_probe_data(probes_by_channel_with_dates, revision_dates, out_dir)
+
+    return update_paths
 
 
 def load_glean_metrics(
@@ -290,126 +303,185 @@ def load_glean_metrics(
     dry_run,
     glean_repos,
     bugzilla_api_key: Optional[str],
+    update_mode: bool = False,
+    commit: Optional[str] = None,
+    branch: Optional[str] = None,
+    glean_repo_url: Optional[str] = None,
+    output_bucket: Optional[str] = None,
 ):
-    repositories = RepositoriesParser().parse(repositories_file, glean_repos)
-    commit_timestamps, repos_metrics_data, emails = git_scraper.scrape(
-        cache_dir, repositories
+    all_repos = RepositoriesParser().parse(repositories_file)
+    if glean_repo_url:
+        if glean_repos:
+            raise ValueError("Must not specify both glean_repos and glean_repo_url")
+        repositories = [r for r in all_repos if r.url == glean_repo_url]
+    elif glean_repos:
+        repositories = [r for r in all_repos if r.name in glean_repos]
+    else:
+        repositories = all_repos
+    if commit and not update_mode:
+        raise ValueError("Must not specify commit without update_mode")
+    commit_timestamps, repos_metrics_data, emails, prod_repos = git_scraper.scrape(
+        cache_dir, repositories, commit, branch
     )
 
     glean_checks.check_glean_metric_structure(repos_metrics_data)
 
-    # Parse metric data from files into the form:
-    # <repo_name>:  {
-    #   <commit-hash>:  {
-    #     <metric-name>: {
-    #       ...
-    #     },
-    #   },
-    #   ...
-    # }
-    tags = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-    metrics = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-    pings = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-    for repo_name, commits in repos_metrics_data.items():
-        for commit_hash, paths in commits.items():
-            tags_files = [p for p in paths if p.endswith(GLEAN_TAGS_FILENAME)]
-            metrics_files = [p for p in paths if p.endswith(GLEAN_METRICS_FILENAME)]
-            pings_files = [p for p in paths if p.endswith(GLEAN_PINGS_FILENAME)]
-
-            try:
-                config = {"allow_reserved": repo_name.startswith("glean")}
-                repo = next(r for r in repositories if r.name == repo_name).to_dict()
-
-                if tags_files:
-                    results, errs = GLEAN_TAGS_PARSER.parse(
-                        tags_files, config, repo["url"], commit_hash
-                    )
-                    tags[repo_name][commit_hash] = results
-
-                if metrics_files:
-                    results, errs = GLEAN_PARSER.parse(
-                        metrics_files, config, repo["url"], commit_hash
-                    )
-                    metrics[repo_name][commit_hash] = results
-
-                if pings_files:
-                    results, errs = GLEAN_PINGS_PARSER.parse(
-                        pings_files, config, repo["url"], commit_hash
-                    )
-                    pings[repo_name][commit_hash] = results
-            except Exception:
-                files = metrics_files + pings_files
-                msg = "Improper file in {}\n{}".format(
-                    ", ".join(files), traceback.format_exc()
-                )
-                emails[repo_name]["emails"].append(
-                    {"subject": "Probe Scraper: Improper File", "message": msg}
-                )
-            else:
-                if errs:
-                    msg = ("Error in processing commit {}\n" "Errors: [{}]").format(
-                        commit_hash, ".".join(errs)
-                    )
-                    emails[repo_name]["emails"].append(
-                        {
-                            "subject": "Probe Scraper: Error on parsing metric or ping files",
-                            "message": msg,
-                        }
-                    )
-
     abort_after_emails = False
 
-    tags_by_repo = {repo: {} for repo in repos_metrics_data}
-    tags_by_repo.update(
-        transform_probes.transform_tags_by_hash(commit_timestamps, tags)
-    )
+    update_paths = []
+    if not update_mode or commit:
+        # write pre-repo data outside update mode and when updating with a commit
+        # Parse metric data from files into the form:
+        # <repo_name>:  {
+        #   <commit-hash>:  {
+        #     <metric-name>: {
+        #       ...
+        #     },
+        #   },
+        #   ...
+        # }
+        tags = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        metrics = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        pings = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 
-    metrics_by_repo = {repo: {} for repo in repos_metrics_data}
-    metrics_by_repo.update(
-        transform_probes.transform_metrics_by_hash(commit_timestamps, metrics)
-    )
+        metrics_by_repo = {}
+        pings_by_repo = {}
+        tags_by_repo = {}
+        # TODO load dependencies for glean_checks.check_for_duplicate_metrics
+        repos_and_dependencies = [repo for repo in repos_metrics_data]
+        for repo in repos_and_dependencies:
+            metrics_by_repo[repo] = {}
+            pings_by_repo[repo] = {}
+            tags_by_repo[repo] = {}
+            if update_mode:
+                # initialize state from prior output
+                base_dir = out_dir / "glean" / repo
+                src = f"{output_bucket}/{base_dir.relative_to(out_dir)}"
+                remote_storage_pull(src, base_dir, decompress=True)
+                try:
+                    with open(os.path.join(base_dir, "metrics"), "r") as metrics_file:
+                        metrics_by_repo[repo] = json.load(metrics_file)
+                except FileNotFoundError:
+                    pass  # this is fine
+                try:
+                    with open(os.path.join(base_dir, "pings"), "r") as pings_file:
+                        pings_by_repo[repo] = json.load(pings_file)
+                except FileNotFoundError:
+                    pass  # this is fine
+                try:
+                    with open(os.path.join(base_dir, "tags"), "r") as tags_file:
+                        tags_by_repo[repo] = json.load(tags_file)
+                except FileNotFoundError:
+                    pass  # this is fine
 
-    pings_by_repo = {repo: {} for repo in repos_metrics_data}
-    pings_by_repo.update(
-        transform_probes.transform_pings_by_hash(commit_timestamps, pings)
-    )
+        for repo_name, commits in repos_metrics_data.items():
+            for commit_hash, paths in commits.items():
+                tags_files = [p for p in paths if p.endswith(GLEAN_TAGS_FILENAME)]
+                metrics_files = [p for p in paths if p.endswith(GLEAN_METRICS_FILENAME)]
+                pings_files = [p for p in paths if p.endswith(GLEAN_PINGS_FILENAME)]
 
-    dependencies_by_repo = {}
-    for repo in repositories:
-        dependencies = {}
-        for dependency in repo.dependencies:
-            dependencies[dependency] = {"type": "dependency", "name": dependency}
-        dependencies_by_repo[repo.name] = dependencies
+                try:
+                    config = {"allow_reserved": repo_name.startswith("glean")}
+                    repo = next(r for r in repositories if r.name == repo_name).to_dict()
 
-    if glean_repos is None or len(glean_repos) > 1:
-        # Don't check for duplicate metrics if we're only parsing
-        # one glean repository (this will almost always crash, since
-        # the libraries that most repositories depend on will not
-        # be specified)
-        abort_after_emails |= glean_checks.check_for_duplicate_metrics(
-            repositories, metrics_by_repo, emails
+                    if tags_files:
+                        results, errs = GLEAN_TAGS_PARSER.parse(
+                            tags_files, config, repo["url"], commit_hash
+                        )
+                        tags[repo_name][commit_hash] = results
+
+                    if metrics_files:
+                        # TODO preserve existing errs
+                        results, errs = GLEAN_PARSER.parse(
+                            metrics_files, config, repo["url"], commit_hash
+                        )
+                        metrics[repo_name][commit_hash] = results
+
+                    if pings_files:
+                        results, errs = GLEAN_PINGS_PARSER.parse(
+                            pings_files, config, repo["url"], commit_hash
+                        )
+                        pings[repo_name][commit_hash] = results
+                except Exception:
+                    if commit:
+                        # TODO pass error email content back to glean push
+                        raise
+                    files = tags_files + metrics_files + pings_files
+                    msg = "Improper file in {}\n{}".format(
+                        ", ".join(files), traceback.format_exc()
+                    )
+                    emails[repo_name]["emails"].append(
+                        {"subject": "Probe Scraper: Improper File", "message": msg}
+                    )
+                else:
+                    if errs:
+                        msg = ("Error in processing commit {}\n" "Errors: [{}]").format(
+                            commit_hash, ".".join(errs)
+                        )
+                        if commit:
+                            # TODO pass error email content back to glean push
+                            raise ValueError(msg)
+                        emails[repo_name]["emails"].append(
+                            {
+                                "subject": "Probe Scraper: Error on parsing metric or ping files",
+                                "message": msg,
+                            }
+                        )
+
+        tags_by_repo.update(
+            transform_probes.transform_tags_by_hash(commit_timestamps, tags)
         )
-    glean_checks.check_for_expired_metrics(
-        repositories, metrics, commit_timestamps, emails, dry_run=dry_run
-    )
 
-    # FOG repos (e.g. firefox-desktop, gecko) use a different expiry mechanism.
-    # Also, expired metrics in FOG repos can have bugs auto-filed for them.
-    fog_emails_by_repo = fog_checks.file_bugs_and_get_emails_for_expiring_metrics(
-        repositories, metrics, commit_timestamps, bugzilla_api_key, dry_run
-    )
-    if fog_emails_by_repo is not None:
-        emails.update(fog_emails_by_repo)
+        metrics_by_repo.update(
+            transform_probes.transform_metrics_by_hash(commit_timestamps, metrics)
+        )
 
-    print("\nwriting output:")
-    write_glean_tag_data(tags_by_repo, out_dir)
-    write_glean_metric_data(metrics_by_repo, dependencies_by_repo, out_dir)
-    write_glean_ping_data(pings_by_repo, out_dir)
-    write_repositories_data(repositories, out_dir)
-    write_general_data(out_dir)
+        pings_by_repo.update(
+            transform_probes.transform_pings_by_hash(commit_timestamps, pings)
+        )
 
-    repos_v2 = RepositoriesParser().parse_v2(repositories_file)
-    write_v2_data(repos_v2, out_dir)
+        dependencies_by_repo = {}
+        for repo in repositories:
+            dependencies = {}
+            for dependency in repo.dependencies:
+                dependencies[dependency] = {"type": "dependency", "name": dependency}
+            dependencies_by_repo[repo.name] = dependencies
+
+        if glean_repos is None or len(glean_repos) > 1:
+            # Don't check for duplicate metrics if we're only parsing
+            # one glean repository (this will almost always crash, since
+            # the libraries that most repositories depend on will not
+            # be specified)
+            abort_after_emails |= glean_checks.check_for_duplicate_metrics(
+                repositories, metrics_by_repo, emails
+            )
+        # TODO raise exceptions?
+        glean_checks.check_for_expired_metrics(
+            repositories, metrics, commit_timestamps, emails, dry_run=dry_run
+        )
+
+        # FOG repos (e.g. firefox-desktop, gecko) use a different expiry mechanism.
+        # Also, expired metrics in FOG repos can have bugs auto-filed for them.
+        fog_emails_by_repo = fog_checks.file_bugs_and_get_emails_for_expiring_metrics(
+            repositories, metrics, commit_timestamps, bugzilla_api_key, dry_run
+        )
+        if fog_emails_by_repo is not None:
+            emails.update(fog_emails_by_repo)
+
+        print("\nwriting output:")
+        write_glean_tag_data(tags_by_repo, out_dir)
+        write_glean_metric_data(metrics_by_repo, dependencies_by_repo, out_dir)
+        write_glean_ping_data(pings_by_repo, out_dir)
+        # in update mode, only write changes for prod repos
+        update_paths += [out_dir / "glean" / repo for repo in prod_repos]
+
+    if not update_mode or not commit:
+        # write generic data outside update mode and when updating without a commit
+        update_paths += write_repositories_data(repositories, out_dir)
+        update_paths += write_general_data(out_dir)
+
+        repos_v2 = RepositoriesParser().parse_v2(repositories_file)
+        update_paths += write_v2_data(repos_v2, out_dir)
 
     for repo_name, email_info in list(emails.items()):
         addresses = email_info["addresses"] + [DEFAULT_TO_EMAIL]
@@ -425,87 +497,34 @@ def load_glean_metrics(
     if abort_after_emails:
         raise ValueError("Errors processing Glean metrics")
 
+    return update_paths
 
-def setup_output_and_cache_dirs(output_bucket, cache_bucket, out_dir, cache_dir):
+
+def setup_output_and_cache_dirs(output_bucket: str, cache_bucket: str, out_dir: Path, cache_dir: Path):
     # Create the output directory
     os.mkdir(out_dir)
 
     # Sync the cache directory
-    cache_path = f"s3://{cache_bucket}/cache/probe-scraper"
-    print(f"Syncing cache from {cache_path} with {cache_dir}")
-    subprocess.check_call(["aws", "s3", "sync", cache_path, cache_dir])
-    return cache_path
+    print(f"Syncing cache from {cache_bucket} with {cache_dir}")
+    remote_storage_pull(cache_bucket, cache_dir)
 
 
-def sync_output_and_cache_dirs(
-    output_bucket, cache_bucket, out_dir, cache_dir, cache_path
+def push_output_and_cache_dirs(
+    output_bucket: str, cache_bucket: str, out_dir: Path, cache_dir: Path, update_mode: bool, update_paths: Optional[List[str]]
 ):
     # Check output dir and then sync with cloudfront
     if not os.listdir(out_dir):
         print("{} is empty".format(out_dir))
         sys.exit(1)
+
+    output_kwargs = {"compress": True, "delete": True}
+    if update_mode:
+        for src in update_paths:
+            dst = f"{output_bucket}/{src.relative_to(out_dir)}"
+            remote_storage_push(src, dst, **output_kwargs)
     else:
-        print("Syncing output dir {}/ with s3://{}/".format(out_dir, output_bucket))
-
-        # cloudfront is supposed to automatically gzip objects, but it won't do that
-        # if the object size is > 10 megabytes (https://webmasters.stackexchange.com/a/111734)
-        # which our files sometimes are. to work around this, we'll regzip the contents into a
-        # temporary directory, and upload that with a special content encoding
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            for root, dirnames, filenames in os.walk(out_dir):
-                rel_root = os.path.relpath(root, start=out_dir)
-                for dirname in dirnames:
-                    os.mkdir(os.path.join(tmpdirname, rel_root, dirname))
-                for filename in filenames:
-                    in_filename = os.path.join(root, filename)
-                    out_filename = os.path.join(tmpdirname, rel_root, filename)
-                    with open(in_filename, "rb") as f1:
-                        with gzip.open(out_filename, "wb") as f2:
-                            f2.write(f1.read())
-
-            # Synchronize the json files and index.html separately,
-            # as they have different mimetypes
-            sync_params = [
-                "--content-encoding",
-                "gzip",
-                "--cache-control",
-                "max-age=28800",
-                "--acl",
-                "public-read",
-            ]
-            subprocess.check_call(
-                [
-                    "aws",
-                    "s3",
-                    "sync",
-                    f"{tmpdirname}/",
-                    f"s3://{output_bucket}/",
-                    "--delete",
-                    "--exclude",
-                    "index.html",
-                    "--content-type",
-                    "application/json",
-                ]
-                + sync_params
-            )
-            subprocess.check_call(
-                [
-                    "aws",
-                    "s3",
-                    "cp",
-                    f"{tmpdirname}/index.html",
-                    f"s3://{output_bucket}/",
-                    "--content-type",
-                    "text/html",
-                ]
-                + sync_params
-            )
-
-        # Sync cache data
-        print(f"Syncing cache dir {cache_dir}/ with {cache_path}")
-        subprocess.check_call(
-            ["aws", "s3", "sync", "--exclude=*.git/*", cache_dir, cache_path]
-        )
+        remote_storage_push(src=out_dir, dst=output_bucket, **output_kwargs)
+    remote_storage_push(src=cache_dir, dst=cache_bucket, exclude="*.git/*")
 
 
 def main(
@@ -516,41 +535,58 @@ def main(
     process_moz_central_probes,
     process_glean_metrics,
     repositories_file,
-    dry_run,
+    send_emails,
     glean_repos,
     firefox_channel,
     output_bucket,
     cache_bucket,
     env,
     bugzilla_api_key: Optional[str],
+    update_mode: bool = False,
+    commit: Optional[str] = None,
+    branch: Optional[str] = None,
+    glean_repo_url: Optional[str] = None,
 ):
+    if not (process_moz_central_probes or process_glean_metrics):
+        process_moz_central_probes = process_glean_metrics = True
 
-    # Sync dirs with s3 if we are not running pytest or local dryruns
-    if env == "prod":
-        cache_path = setup_output_and_cache_dirs(
+    # Pull cache if we are not running pytest or local dryruns or update mode
+    if env == "prod" and not update_mode:
+        setup_output_and_cache_dirs(
             output_bucket, cache_bucket, out_dir, cache_dir
         )
 
-    process_both = not (process_moz_central_probes or process_glean_metrics)
-    if process_moz_central_probes or process_both:
-        load_moz_central_probes(
-            cache_dir, out_dir, firefox_version, min_firefox_version, firefox_channel
+    update_paths = []
+    if process_moz_central_probes:
+        update_paths += load_moz_central_probes(
+            cache_dir,
+            out_dir,
+            firefox_version,
+            min_firefox_version,
+            firefox_channel,
+            update_mode,
         )
-    if process_glean_metrics or process_both:
-        load_glean_metrics(
+
+    if process_glean_metrics:
+        update_paths += load_glean_metrics(
             cache_dir,
             out_dir,
             repositories_file,
-            dry_run,
+            send_emails,
             glean_repos,
             bugzilla_api_key,
+            update_mode,
+            commit,
+            branch,
+            glean_repo_url,
+            output_bucket,
         )
 
-    # Sync results with s3 if we are not running pytest or local dryruns
+    # Sync results if we are not running pytest or local dryruns
     if env == "prod":
-        sync_output_and_cache_dirs(
-            output_bucket, cache_bucket, out_dir, cache_dir, cache_path
-        )
+        push_output_and_cache_dirs(output_bucket, cache_bucket, out_dir, cache_dir, update_mode, update_paths)
+
+    return update_paths
 
 
 if __name__ == "__main__":
@@ -595,13 +631,13 @@ if __name__ == "__main__":
         "--output-bucket",
         help="The output s3 cloudfront bucket where out-dir will be syncd.",
         type=str,
-        default="net-mozaws-prod-us-west-2-data-pitmo",
+        default="s3://net-mozaws-prod-us-west-2-data-pitmo",
     )
     parser.add_argument(
         "--cache-bucket",
         help="The cache bucket for probe scraper.",
         type=str,
-        default="telemetry-airflow-cache",
+        default="s3://telemetry-airflow-cache/cache/probe-scraper",
     )
     parser.add_argument(
         "--env",
@@ -645,14 +681,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(
-        args.cache_dir,
-        args.out_dir,
+        Path(args.cache_dir),
+        Path(args.out_dir),
         args.firefox_version,
         args.min_firefox_version,
         args.moz_central,
         args.glean,
         args.repositories_file,
-        args.dry_run,
+        args.dry_run,  # send_emails==dry_run
         args.glean_repos,
         args.firefox_channel,
         args.output_bucket,

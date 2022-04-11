@@ -1,0 +1,16 @@
+name: "probe-scraper GLEAN push"
+description: Push a commit for a GLEAN application to probe-scraper
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      # TODO use prod function URL
+      run: >-
+        curl
+        https://us-central1-relud1.cloudfunctions.net/glean-push
+        --data
+        '{
+        "url": "${{github.server_url}}/${{github.repository}}",
+        "commit":"${{github.sha}}",
+        "branch":"${{github.ref_name}}"
+        }'

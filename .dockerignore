@@ -1,0 +1,5 @@
+.dockerignore
+glean-push/
+venv/
+temp/
+*.pyc

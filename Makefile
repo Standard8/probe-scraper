@@ -7,11 +7,12 @@ help:
 	@echo "  lint                   Check style with flake8"
 	@echo "  format                 Format code with black and isort"
 	@echo "  test                   Run tests quickly with the default Python"
-	@echo "  build                  Builds the docker images for the docker-compose setup"
+	@echo "  build                  Builds the docker image for the docker-compose setup"
+	@echo "  build-glean-push       Builds the docker image for pushing glean commits from CI"
 	@echo "  docker-rm              Stops and removes all docker containers"
 	@echo "  shell                  Opens a Bash shell"
 	@echo "  run                    Run a command. Can run scripts, e.g. make run COMMAND=\"./scripts/schema_generator.sh\""
-	@echo "  stop                   Stop docker compose"
+	@echo "  stop                   Stop docker-compose"
 
 clean: clean-build clean-pyc docker-rm
 
@@ -55,7 +56,10 @@ burnham-dryrun:
 	docker-compose run app python -m probe_scraper.runner --glean --glean-repo glean-core --glean-repo glean-android --glean-repo burnham --dry-run
 
 build:
-	docker-compose build
+	docker-compose build app
+
+build-glean-push:
+	docker-compose build glean-push
 
 docker-rm: stop
 	docker-compose rm -f
