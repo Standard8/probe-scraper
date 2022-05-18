@@ -5,15 +5,14 @@
 import argparse
 import datetime
 import errno
-import gzip
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import traceback
 from collections import defaultdict
-from typing import Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from dateutil.tz import tzlocal
 
@@ -23,9 +22,10 @@ from .parsers.events import EventsParser
 from .parsers.histograms import HistogramsParser
 from .parsers.metrics import GleanMetricsParser
 from .parsers.pings import GleanPingsParser
-from .parsers.repositories import RepositoriesParser
+from .parsers.repositories import RepositoriesParser, Repository
 from .parsers.scalars import ScalarsParser
 from .parsers.tags import GleanTagsParser
+from .remote_storage import remote_storage_pull, remote_storage_push
 from .scrapers import git_scraper, moz_central_scraper
 
 
@@ -62,7 +62,7 @@ def general_data():
     }
 
 
-def dump_json(data, out_dir, file_name):
+def dump_json(data: Any, out_dir: Path, file_name: str):
     # Make sure that the output directory exists. This also creates
     # intermediate directories if needed.
     try:
@@ -75,7 +75,7 @@ def dump_json(data, out_dir, file_name):
         if isinstance(o, datetime.datetime):
             return o.isoformat()
 
-    path = os.path.join(out_dir, file_name)
+    path = out_dir / file_name
     with open(path, "w") as f:
         print("  " + path)
         json.dump(
@@ -88,9 +88,11 @@ def dump_json(data, out_dir, file_name):
         )
 
 
-def write_moz_central_probe_data(probe_data, revisions, out_dir):
-    # Save all our files to "outdir/firefox/..." to mimic a REST API.
-    base_dir = os.path.join(out_dir, "firefox")
+def write_moz_central_probe_data(
+    probe_data: Dict[str, Any], revisions: Any, out_dir: Path
+):
+    # Save all our files to "out_dir/firefox/..." to mimic a REST API.
+    base_dir = out_dir / "firefox"
 
     print("\nwriting output:")
     dump_json(general_data(), base_dir, "general")
@@ -100,13 +102,13 @@ def write_moz_central_probe_data(probe_data, revisions, out_dir):
     # file in this case, the probe data will contain human readable version
     # numbers along with revision numbers.
     for channel, channel_probes in probe_data.items():
-        data_dir = os.path.join(base_dir, channel, "main")
+        data_dir = base_dir / channel / "main"
         dump_json(channel_probes, data_dir, "all_probes")
 
 
-def write_general_data(out_dir):
+def write_general_data(out_dir: Path):
     dump_json(general_data(), out_dir, "general")
-    with open(os.path.join(out_dir, "index.html"), "w") as f:
+    with open(out_dir / "index.html", "w") as f:
         f.write(
             """
             <html><head><title>Mozilla Probe Info</title></head>
@@ -118,44 +120,45 @@ def write_general_data(out_dir):
         )
 
 
-def write_glean_metric_data(metrics, dependencies, out_dir):
-    # Save all our files to "outdir/glean/<repo>/..." to mimic a REST API.
+def write_glean_metric_data(
+    metrics: Dict[str, Any], dependencies: Dict[str, Any], out_dir: Path
+):
+    # Save all our files to "out_dir/glean/<repo>/..." to mimic a REST API.
     for repo, metrics_data in metrics.items():
         dependencies_data = dependencies[repo]
 
-        base_dir = os.path.join(out_dir, "glean", repo)
+        base_dir = out_dir / "glean" / repo
 
         dump_json(general_data(), base_dir, "general")
         dump_json(metrics_data, base_dir, "metrics")
         dump_json(dependencies_data, base_dir, "dependencies")
 
 
-def write_glean_tag_data(tags, out_dir):
-    # Save all our files to "outdir/glean/<repo>/..." to mimic a REST API.
+def write_glean_tag_data(tags: Dict[str, Any], out_dir: Path):
+    # Save all our files to "out_dir/glean/<repo>/..." to mimic a REST API.
     for repo, tags_data in tags.items():
-        base_dir = os.path.join(out_dir, "glean", repo)
+        base_dir = out_dir / "glean" / repo
         dump_json(tags_data, base_dir, "tags")
 
 
-def write_glean_ping_data(pings, out_dir):
-    # Save all our files to "outdir/glean/<repo>/..." to mimic a REST API.
+def write_glean_ping_data(pings: Dict[str, Any], out_dir: Path):
+    # Save all our files to "out_dir/glean/<repo>/..." to mimic a REST API.
     for repo, pings_data in pings.items():
-        base_dir = os.path.join(out_dir, "glean", repo)
+        base_dir = out_dir / "glean" / repo
         dump_json(pings_data, base_dir, "pings")
 
 
-def write_repositories_data(repos, out_dir):
+def write_repositories_data(repos: List[Repository], out_dir: Path):
     json_data = [r.to_dict() for r in repos]
-    dump_json(json_data, os.path.join(out_dir, "glean"), "repositories")
+    dump_json(json_data, out_dir, "repositories")
 
 
-def write_v2_data(repos, out_dir):
-    dump_json(
-        repos["app-listings"], os.path.join(out_dir, "v2", "glean"), "app-listings"
-    )
+def write_v2_data(repos: Dict[str, Any], out_dir: Path):
+    base_dir = out_dir / "v2" / "glean"
+    dump_json(repos["app-listings"], base_dir, "app-listings")
     dump_json(
         repos["library-variants"],
-        os.path.join(out_dir, "v2", "glean"),
+        base_dir,
         "library-variants",
     )
 
@@ -426,86 +429,27 @@ def load_glean_metrics(
         raise ValueError("Errors processing Glean metrics")
 
 
-def setup_output_and_cache_dirs(output_bucket, cache_bucket, out_dir, cache_dir):
+def setup_output_and_cache_dirs(
+    output_bucket: str, cache_bucket: str, out_dir: Path, cache_dir: Path
+):
     # Create the output directory
     os.mkdir(out_dir)
 
     # Sync the cache directory
-    cache_path = f"s3://{cache_bucket}/cache/probe-scraper"
-    print(f"Syncing cache from {cache_path} with {cache_dir}")
-    subprocess.check_call(["aws", "s3", "sync", cache_path, cache_dir])
-    return cache_path
+    print(f"Syncing cache from {cache_bucket} with {cache_dir}")
+    remote_storage_pull(cache_bucket, cache_dir)
 
 
-def sync_output_and_cache_dirs(
-    output_bucket, cache_bucket, out_dir, cache_dir, cache_path
+def push_output_and_cache_dirs(
+    output_bucket: str, cache_bucket: str, out_dir: Path, cache_dir: Path
 ):
-    # Check output dir and then sync with cloudfront
+    # Check output dir and then sync with remote storage
     if not os.listdir(out_dir):
         print("{} is empty".format(out_dir))
         sys.exit(1)
-    else:
-        print("Syncing output dir {}/ with s3://{}/".format(out_dir, output_bucket))
 
-        # cloudfront is supposed to automatically gzip objects, but it won't do that
-        # if the object size is > 10 megabytes (https://webmasters.stackexchange.com/a/111734)
-        # which our files sometimes are. to work around this, we'll regzip the contents into a
-        # temporary directory, and upload that with a special content encoding
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            for root, dirnames, filenames in os.walk(out_dir):
-                rel_root = os.path.relpath(root, start=out_dir)
-                for dirname in dirnames:
-                    os.mkdir(os.path.join(tmpdirname, rel_root, dirname))
-                for filename in filenames:
-                    in_filename = os.path.join(root, filename)
-                    out_filename = os.path.join(tmpdirname, rel_root, filename)
-                    with open(in_filename, "rb") as f1:
-                        with gzip.open(out_filename, "wb") as f2:
-                            f2.write(f1.read())
-
-            # Synchronize the json files and index.html separately,
-            # as they have different mimetypes
-            sync_params = [
-                "--content-encoding",
-                "gzip",
-                "--cache-control",
-                "max-age=28800",
-                "--acl",
-                "public-read",
-            ]
-            subprocess.check_call(
-                [
-                    "aws",
-                    "s3",
-                    "sync",
-                    f"{tmpdirname}/",
-                    f"s3://{output_bucket}/",
-                    "--delete",
-                    "--exclude",
-                    "index.html",
-                    "--content-type",
-                    "application/json",
-                ]
-                + sync_params
-            )
-            subprocess.check_call(
-                [
-                    "aws",
-                    "s3",
-                    "cp",
-                    f"{tmpdirname}/index.html",
-                    f"s3://{output_bucket}/",
-                    "--content-type",
-                    "text/html",
-                ]
-                + sync_params
-            )
-
-        # Sync cache data
-        print(f"Syncing cache dir {cache_dir}/ with {cache_path}")
-        subprocess.check_call(
-            ["aws", "s3", "sync", "--exclude=*.git/*", cache_dir, cache_path]
-        )
+    remote_storage_push(src=out_dir, dst=output_bucket, compress=True, delete=True)
+    remote_storage_push(src=cache_dir, dst=cache_bucket, exclude="*.git/*")
 
 
 def main(
@@ -525,18 +469,21 @@ def main(
     bugzilla_api_key: Optional[str],
 ):
 
-    # Sync dirs with s3 if we are not running pytest or local dryruns
+    # Sync dirs with remote storage if we are not running pytest or local dryruns
     if env == "prod":
-        cache_path = setup_output_and_cache_dirs(
-            output_bucket, cache_bucket, out_dir, cache_dir
-        )
+        setup_output_and_cache_dirs(output_bucket, cache_bucket, out_dir, cache_dir)
 
-    process_both = not (process_moz_central_probes or process_glean_metrics)
-    if process_moz_central_probes or process_both:
+    if not (process_moz_central_probes or process_glean_metrics):
+        process_moz_central_probes = process_glean_metrics = True
+    if process_moz_central_probes:
         load_moz_central_probes(
-            cache_dir, out_dir, firefox_version, min_firefox_version, firefox_channel
+            cache_dir,
+            out_dir,
+            firefox_version,
+            min_firefox_version,
+            firefox_channel,
         )
-    if process_glean_metrics or process_both:
+    if process_glean_metrics:
         load_glean_metrics(
             cache_dir,
             out_dir,
@@ -546,11 +493,9 @@ def main(
             bugzilla_api_key,
         )
 
-    # Sync results with s3 if we are not running pytest or local dryruns
+    # Sync results if we are not running pytest or local dryruns
     if env == "prod":
-        sync_output_and_cache_dirs(
-            output_bucket, cache_bucket, out_dir, cache_dir, cache_path
-        )
+        push_output_and_cache_dirs(output_bucket, cache_bucket, out_dir, cache_dir)
 
 
 if __name__ == "__main__":
@@ -595,13 +540,13 @@ if __name__ == "__main__":
         "--output-bucket",
         help="The output s3 cloudfront bucket where out-dir will be syncd.",
         type=str,
-        default="net-mozaws-prod-us-west-2-data-pitmo",
+        default="s3://net-mozaws-prod-us-west-2-data-pitmo",
     )
     parser.add_argument(
         "--cache-bucket",
         help="The cache bucket for probe scraper.",
         type=str,
-        default="telemetry-airflow-cache",
+        default="s3://telemetry-airflow-cache/cache/probe-scraper",
     )
     parser.add_argument(
         "--env",
@@ -645,8 +590,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(
-        args.cache_dir,
-        args.out_dir,
+        Path(args.cache_dir),
+        Path(args.out_dir),
         args.firefox_version,
         args.min_firefox_version,
         args.moz_central,
